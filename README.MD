@@ -39,7 +39,8 @@ Run the setup script — it creates the venv, prompts for secrets,
 installs the launchd schedule, and runs a dry-run test:
 
 ```bash
-cd cloudops/apps/CLOUDEVOPS-4875-review-agent-jira-daily-updater
+git clone https://github.com/ilyaro/ai-review-agent-jira-daily-updater
+cd ai-review-agent-jira-daily-updater
 bash setup.sh [repos-root-dir]
 ```
 
