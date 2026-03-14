@@ -25,7 +25,6 @@ from jira import JIRA
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-WORKING_HOUR    = 23                    # runs once at 23:00
 AGENT_MARKER    = "<!-- review-agent -->"  # fingerprint injected into every review
 LOG_DIR         = Path.home() / "Library/Logs"
 LOG_FILE        = LOG_DIR / f"review-agent.{datetime.now().strftime('%Y-%m-%d')}.log"
@@ -88,11 +87,11 @@ def load_secrets() -> dict:
 
 # ── Guard: working hours ──────────────────────────────────────────────────────
 
-def is_working_time() -> bool:
-    now = datetime.now()
-    return now.weekday() < 5 and now.hour == WORKING_HOUR
+# def is_working_time() -> bool:
+#     now = datetime.now()
+#     return now.weekday() < 5 and now.hour == WORKING_HOUR
 
-# ── Git helpers ───────────────────────────────────────────────────────────────
+ # ── Git helpers ───────────────────────────────────────────────────────────────
 
 def git(args: list[str], cwd: Path) -> str:
     result = subprocess.run(
@@ -261,20 +260,24 @@ def ai_work_summary(client, commits: list, pr_title: str) -> str:
         ],
     )
     return response.choices[0].message.content
-
-def build_jira_comment(pr_url: str, pr_title: str, new_commits: list, work_summary: str) -> str:
+ 
+def build_internal_notes(pr_url: str, pr_title: str, new_commits: list, work_summary: str) -> str:
+    """Build a bulleted-list version of the daily update for the Internal Notes field."""
     today = datetime.now().strftime("%Y-%m-%d")
-    commit_lines = "\n".join(
-        f"* {c.commit.message.splitlines()[0]}" for c in new_commits
-    ) or "* (no new commits today)"
- 
-    return (
-        f"*Automated daily update — {today}*\n\n"
-        f"*PR:* [{pr_title}|{pr_url}]\n\n"
-        f"*Commits today:*\n{commit_lines}\n\n"
-        f"*What was done:*\n{work_summary}\n"
-     )
- 
+    lines = [
+        f"* Automated daily update - {today}",
+        f"* PR: [{pr_title}|{pr_url}]",
+    ]
+    for c in new_commits:
+        lines.append(f"* {c.commit.message.splitlines()[0]}")
+    if not new_commits:
+        lines.append("* (no new commits today)")
+    for line in work_summary.splitlines():
+        line = line.strip()
+        if line:
+            lines.append(f"* {line}")
+    return "\n".join(lines)
+  
  # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def process_repo(
@@ -372,12 +375,12 @@ def process_repo(
         if new_commits:
             log.info("    generating work summary for Jira...")
             work_summary = ai_work_summary(ai_client, new_commits, pr.title)
-            jira_comment = build_jira_comment(pr.html_url, pr.title, new_commits, work_summary)
+            notes_text = build_internal_notes(pr.html_url, pr.title, new_commits, work_summary)
 
             # Update "Internal Notes" custom field
             internal_notes_id = resolve_jira_field_id(jira_client, "Internal Notes")
             if not dry_run and internal_notes_id:
-                jira_client.issue(jira_key).update(fields={internal_notes_id: work_summary})
+                jira_client.issue(jira_key).update(fields={internal_notes_id: notes_text})
                 log.info("    ✓ Jira Internal Notes (%s) updated for %s", internal_notes_id, jira_key)
             elif not internal_notes_id:
                 log.warning("    field 'Internal Notes' not found in Jira — skipping field update")
@@ -386,64 +389,67 @@ def process_repo(
 
             # Post Jira comment
             if dry_run:
-                log.info("    [DRY RUN] would post Jira comment to %s:\n%s", jira_key, jira_comment[:300])
+                log.info("    [DRY RUN] would post Jira comment to %s:\n%s", jira_key, notes_text[:300])
             else:
-                jira_client.add_comment(jira_key, jira_comment)
+                jira_client.add_comment(jira_key, notes_text)
                 log.info("    ✓ Jira comment posted to %s", jira_key)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Daily code review agent")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Print actions without posting anything")
+                          help="Print actions without posting anything")
     parser.add_argument("--force", action="store_true",
                         help="Run even outside working hours")
     parser.add_argument("--repo", type=str,
-                        help="Process only this repo name (for testing)")
+                         help="Process only this repo name (for testing)")
     parser.add_argument("--repos-root", type=str, required=True,
                         help="Root directory containing git repos to scan")
     args = parser.parse_args()
-
+ 
     REPOS_ROOT = Path(args.repos_root)
-
+  
+    # if not args.force and not is_working_time():
+    #     log.info("Outside working hours — exiting (use --force to override)")
+    #     sys.exit(0)
     if not args.force and not is_working_time():
         log.info("Outside working hours — exiting (use --force to override)")
         sys.exit(0)
-
+ 
     log.info("=== review-agent starting (dry_run=%s) ===", args.dry_run)
     cleanup_old_logs()
-
+ 
     secrets = load_secrets()
-
+ 
     gh          = Github(auth=Auth.Token(secrets["github_token"]))
     jira_client = JIRA(
         server=secrets["jira_server"],
         token_auth=secrets["jira_token"],
-     )
+    )
     ai_client   = AzureOpenAI(
         azure_endpoint=secrets["azure_endpoint"],
         api_key=secrets["openai_key"],
         api_version="2025-04-01-preview",
     )
-
+ 
     if not REPOS_ROOT.exists():
         log.error("REPOS_ROOT %s does not exist", REPOS_ROOT)
         sys.exit(1)
-
+ 
     repos = (
         [REPOS_ROOT / args.repo] if args.repo
         else [p for p in REPOS_ROOT.iterdir() if p.is_dir() and (p / ".git").exists()]
     )
-
+ 
     if not repos:
         log.warning("No git repos found under %s", REPOS_ROOT)
-
+ 
     for repo_path in repos:
         try:
             process_repo(repo_path, gh, jira_client, ai_client, dry_run=args.dry_run, github_token=secrets["github_token"])
         except Exception as e:
             log.exception("Unhandled error processing %s: %s", repo_path.name, e)
-
+ 
     log.info("=== review-agent done ===")
 
 
